@@ -5,7 +5,7 @@ from miniworld.miniworld import MiniWorldEnv
 import numpy as np
 
 class StaticMaze(MiniWorldEnv, utils.EzPickle):
-     def __init__(self, max_episode_steps=300, **kwargs):
+    def __init__(self, max_episode_steps=300, **kwargs):
         self.num_rows = 3
         self.num_cols = 3
         self.room_size = 3
@@ -17,7 +17,7 @@ class StaticMaze(MiniWorldEnv, utils.EzPickle):
         # Only allow movement actions
         self.action_space = spaces.Discrete(self.actions.move_forward + 1)
 
-     def _gen_world(self):
+    def _gen_world(self):
         # === Create a 2x2 grid of rooms ===
         grid = []
         for r in range(self.num_rows):
@@ -45,8 +45,8 @@ class StaticMaze(MiniWorldEnv, utils.EzPickle):
         self.connect_rooms(
             grid[0][0],
             grid[1][0],
-            min_x=grid[0][0].min_x + s / 2 - 0.75,
-            max_x=grid[0][0].min_x + s / 2 + 0.75,
+            min_x=grid[0][0].min_x,
+            max_x=grid[0][0].max_x
         )
 
         # Connect top-right → bottom-right
@@ -62,26 +62,34 @@ class StaticMaze(MiniWorldEnv, utils.EzPickle):
         self.connect_rooms(
             grid[2][0],
             grid[2][1],
-            min_z=grid[2][0].min_z + s / 2 - 0.75,
-            max_z=grid[2][1].min_z + s / 2 + 0.75,
+            min_z=grid[2][0].min_z,
+            max_z=grid[2][1].max_z,
         )
 
         self.connect_rooms(
             grid[2][1],
             grid[2][2],
-            min_z=grid[2][1].min_z + s / 2 - 0.75,
-            max_z=grid[2][2].min_z + s / 2 + 0.75,
+            min_z=grid[2][1].min_z,
+            max_z=grid[2][2].max_z,
         )
 
         self.connect_rooms(
             grid[1][1],
             grid[1][2],
-            min_z=grid[1][1].min_z + s / 2 - 0.75,
-            max_z=grid[1][2].min_z + s / 2 + 0.75,
+            min_z=grid[1][1].min_z,
+            max_z=grid[1][2].max_z
         )
 
         self.connect_rooms(
+            grid[0][1],
             grid[0][2],
+            min_z=grid[0][1].min_z,
+            max_z=grid[0][2].min_z+ s / 2 + 0.75
+        )
+
+
+        self.connect_rooms(
+            grid[2][2],
             grid[1][2],
             min_x=grid[0][2].min_x,
             max_x=grid[1][2].max_x,
@@ -95,18 +103,20 @@ class StaticMaze(MiniWorldEnv, utils.EzPickle):
             max_x=grid[1][0].max_x,
         )
 
-        self.connect_rooms(
-            grid[1][1],
-            grid[2][1],
-            min_x=grid[1][1].min_x,
-            max_x=grid[1][1].max_x,
-        )
-
 
         # --- Agent spawn and goal ---
         self.place_agent(room=grid[0][0], dir=0)
         self.box = self.place_entity(Box(color="red"))
-        self.goal = self.place_entity(self.box, room=grid[1][2])
+        self.goal = self.place_entity(self.box, room=grid[0][2])
+
+    def step(self, action):
+        obs, reward, termination, truncation, info = super().step(action)
+
+        if self.near(self.box):
+            reward += self._reward()
+            termination = True
+
+        return obs, reward, termination, truncation, info
      
 
 class StaticMazeSmall(MiniWorldEnv, utils.EzPickle):
@@ -174,7 +184,7 @@ class StaticMazeSmall(MiniWorldEnv, utils.EzPickle):
         # --- Agent spawn and goal ---
         self.place_agent(room=grid[0][0], dir=0)
         self.box = self.place_entity(Box(color="red"))
-        self.goal = self.place_entity(self.box, room=grid[1][1])
+        self.goal = self.place_entity(self.box)#, room=grid[1][1])
 
     def step(self, action):
         obs, reward, termination, truncation, info = super().step(action)
