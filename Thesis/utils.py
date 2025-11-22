@@ -37,10 +37,10 @@ def compute_reward(prev_pos, curr_pos, goal_pos, visited, norm_scale=12.0):
     
     # Distance improvement (positive when getting closer)
     delta = (old_dist - new_dist) / norm_scale
-    reward = 1.0 * delta
+    reward = 2.0 * delta
 
     # Small step penalty to encourage efficient movement
-    reward -= 0.02
+    reward -= 0.005
 
     # Exploration bonus for visiting new ground
     pos_key = (round(curr_pos[0], 1), round(curr_pos[2], 1))
@@ -53,8 +53,7 @@ def compute_reward(prev_pos, curr_pos, goal_pos, visited, norm_scale=12.0):
         reward += 15.0
 
     # Clip rewards to avoid instability
-    return float(np.clip(reward, -2.0, 2.0))
-
+    return reward #float(np.clip(reward, -1.0, 1.0))
 
 def compute_enhanced_reward(prev_pos, curr_pos, goal_pos, visited, steps_taken, max_steps=500):
     """Reward function for later curriculum stages (3–5).
@@ -79,7 +78,7 @@ def compute_enhanced_reward(prev_pos, curr_pos, goal_pos, visited, steps_taken, 
     success_bonus = 0.0
     if new_dist < 0.4:
         efficiency = 1.0 - (steps_taken / max_steps)
-        success_bonus = 10.0 + (5.0 * efficiency)
+        success_bonus = 15.0 + (5.0 * efficiency) 
 
     # 4. Mild exploration bonus (less important in later stages)
     pos_key = (round(curr_pos[0], 1), round(curr_pos[2], 1))
@@ -115,7 +114,7 @@ def train(env, num_episodes, agent, device, rollout):
     #plt.ion()
     #fig, (ax_top, ax_fp) = plt.subplots(1, 2, figsize=(8, 4))
 
-    USE_CURIOSITY = True #toggle curiosity on and off
+    USE_CURIOSITY = True  #toggle curiosity on and off
 
     if USE_CURIOSITY:
         curiosity_module = CuriosityModule(
@@ -159,13 +158,13 @@ def train(env, num_episodes, agent, device, rollout):
             curr_pos = env.unwrapped.agent.pos.copy()
 
             # ---- Reward shaping ----
-            #reward = compute_reward(prev_pos, curr_pos, goal_pos, visited) #for earlier stages
-            reward = compute_enhanced_reward(prev_pos, curr_pos, goal_pos, visited, steps_in_episode) #for later, harder stages
+            reward = compute_reward(prev_pos, curr_pos, goal_pos, visited) #for earlier stages
+            #reward = compute_enhanced_reward(prev_pos, curr_pos, goal_pos, visited, steps_in_episode) #for later, harder stages
             next_state = build_state(curr_pos, goal_pos, env)
 
             intrinsic_reward = 0.0
 
-            intrinsic_reward = curiosity_module.compute_intrinsic_reward(state, action, next_state)
+            intrinsic_reward = curiosity_module.compute_intrinsic_reward(state, action, next_state) * 0.5
             intrinsic_rewards.append(intrinsic_reward)
             
             # ---- Combined reward ----
@@ -254,3 +253,143 @@ def plot_training_curve(df, env):
             #plt.pause(0.001)
 
 
+def train_spat(env, num_episodes, agent, device, rollout, agent_pos, goal_pos):
+    success_count = 0
+    success_log = []
+    steps_since_update = 0
+
+    for episode in range(num_episodes):
+
+        # ---- Reset environment ----
+        obs, _ = env.reset()
+        episode_reward = 0.0
+        done = False
+        visited = set()
+        step = 0
+
+        # ---- Reset recurrent states (on device) ----
+        memory, conv_state, lstm_state = agent.model.init_states(batch_size=1, device=device)
+        prev_pos = env.unwrapped.agent.pos.copy()
+
+        while not done and step < rollout:
+            agent_pos = env.unwrapped.agent.pos
+            goal_pos = env.unwrapped.box.pos
+
+            # build state and pos coords (state on device, pos on device)
+            state = build_spat_state(agent_pos, goal_pos, env).unsqueeze(0).to(device)
+            pos_coords = build_position_coords(agent_pos, env).unsqueeze(0).to(device)
+
+            # ---- capture hidden BEFORE forward (clone+detach to freeze)
+            hidden_before = {
+                "memory": memory.clone().detach(),
+                "conv_h": conv_state[0].clone().detach(),
+                "conv_c": conv_state[1].clone().detach(),
+                "lstm_h": lstm_state[0].clone().detach(),
+                "lstm_c": lstm_state[1].clone().detach(),
+            }
+
+            # ---- Step using spatial PPO agent (act uses device tensors) ----
+            action, logp, value, memory, conv_state, lstm_state = agent.act(
+                state,
+                memory,
+                conv_state,
+                lstm_state,
+                pos_coords
+            )
+
+            # ---- Step environment  ----
+            next_obs, env_reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            curr_pos = env.unwrapped.agent.pos
+            agent.model.total_env_steps += 1
+
+            # ---- Reward shaping (include env-provided reward) ----
+            reward = compute_reward(prev_pos, curr_pos, goal_pos, visited)
+            prev_pos = curr_pos.copy()
+
+            # ---- Store transition for PPO using hidden_before ----
+            agent.store(
+                obs=state.squeeze(0),        
+                position=pos_coords.squeeze(0),         
+                action=action,
+                logp=logp,                   
+                reward=reward,
+                done=done,
+                value=value,
+                hidden=hidden_before         
+            )
+
+            episode_reward += reward
+
+            # ---- move to next state----
+            step += 1
+            steps_since_update += 1
+
+            # ---- Trigger PPO update when we have rollout_len samples ----
+            if len(agent.obs_buf) >= agent.rollout_len:
+                agent.update()
+                steps_since_update = 0
+
+        # ---- Episode logging ----
+        success = 1 if done and terminated else 0
+        success_count += success
+        success_log.append(success)
+
+        if (episode+1) % 10 == 0:
+            print(
+                f"Episode {episode+1}/{num_episodes} | "
+                f"Reward: {episode_reward:.2f} | Success: {bool(success)} | "
+                f"SuccessRate={(success_count/(episode+1))*100:.1f}%"
+            )
+
+    return success_log
+
+def build_spat_state(agent_pos, goal_pos, env, grid_size=16):
+    min_x, max_x = env.unwrapped.min_x, env.unwrapped.max_x
+    min_z, max_z = env.unwrapped.min_z, env.unwrapped.max_z
+
+    state_map = np.zeros((3, grid_size, grid_size), dtype=np.float32)
+
+    def to_grid(pos):
+        gx = (pos[0] - min_x) / (max_x - min_x)
+        gz = (pos[2] - min_z) / (max_z - min_z)
+        gx = int(gx * (grid_size - 1))
+        gz = int(gz * (grid_size - 1))
+        return np.clip(gx, 0, grid_size - 1), np.clip(gz, 0, grid_size - 1)
+
+    agent_x, agent_z = to_grid(agent_pos)
+    goal_x, goal_z = to_grid(goal_pos)
+
+    state_map[0, agent_z, agent_x] = 1.0
+    state_map[1, goal_z, goal_x] = 1.0
+
+    heading = env.unwrapped.agent.dir
+    fov = np.deg2rad(90)
+    n_rays = 19
+    max_range = 4.0
+    steps = 25
+
+    for k in range(n_rays):
+        angle = heading + fov * (k / (n_rays - 1) - 0.5)
+        dx = np.cos(angle)
+        dz = np.sin(angle)
+        for t in range(1, steps + 1):
+            dist = (t / steps) * max_range
+            wx = agent_pos[0] + dx * dist
+            wz = agent_pos[2] + dz * dist
+            if wx < min_x or wx > max_x or wz < min_z or wz > max_z:
+                break
+            gx, gz = to_grid([wx, 0, wz])
+            state_map[2, gz, gx] = 1.0
+    state_map[2, agent_z, agent_x] = 1.0
+
+    return torch.from_numpy(state_map).float()
+
+def build_position_coords(agent_pos, env):
+    min_x, max_x = env.unwrapped.min_x, env.unwrapped.max_x
+    min_z, max_z = env.unwrapped.min_z, env.unwrapped.max_z
+    x = (agent_pos[0] - min_x) / (max_x - min_x)
+    z = (agent_pos[2] - min_z) / (max_z - min_z)
+    x = np.clip(x, 0.01, 0.99)
+    z = np.clip(z, 0.01, 0.99)
+    return torch.tensor([x,z], dtype=torch.float32)
