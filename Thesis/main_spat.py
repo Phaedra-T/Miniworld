@@ -9,22 +9,24 @@ from utils import build_spat_state, get_latest_checkpoint, train_spat, log_metri
 
 
 # --- Hyperparameters ---
-env_name = "MiniWorld-OneRoom-v0"
-NUM_EPISODES = 2000
-LR = 3e-4
-GAMMA = 0.995
+env_name = "MiniWorld-OneRoomS6-v0" 
+NUM_EPISODES = 20000 
+LR = 1e-4
+GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP = 0.2
-ENTROPY = 0.1
-VALUE_COEF = 0.5
+CLIP = 0.05
+ENTROPY = 0.02
+VALUE_COEF = 0.25
 MAX_GRAD_NORM = 1.0
 ROLLOUT_LEN = 512
 EPOCHS = 4
-MINIBATCHES = 4
-WRITE_WARMUP_STEPS = 800
+CHUNK_LEN = 32
+WRITE_WARMUP_STEPS = 1000
+
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
+
 
 # --- Paths ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -32,9 +34,14 @@ checkpoint_dir = os.path.join(script_dir, "checkpoints")
 os.makedirs(checkpoint_dir, exist_ok=True)
 
 # --- Initialize environment ---
-env = gym.make(env_name, render_mode= None)
-env.set_wrapper_attr(name="max_episode_steps", value=800)
+env = gym.make(env_name, render_mode= None )
+env.set_wrapper_attr(name="max_episode_steps", value=100)
 obs, _ = env.reset()
+
+NORM_SCALE = max(
+    env.unwrapped.max_x - env.unwrapped.min_x,
+    env.unwrapped.max_z - env.unwrapped.min_z
+)
 
 # --- Build Initial State ---
 agent_spawn = env.unwrapped.agent.pos
@@ -57,7 +64,7 @@ agent = PPOAgent(
     lr=LR,
     max_grad_norm=MAX_GRAD_NORM,
     rollout_len=ROLLOUT_LEN,
-    chunk_len=64,                  
+    chunk_len=CHUNK_LEN,                  
     entropy_coef=ENTROPY,
     value_coef=VALUE_COEF,
     epochs=EPOCHS,
@@ -73,17 +80,17 @@ else:
     print("⚠️ No checkpoint found. Training from scratch!")
 
 # --- Training ---
-success_log = train_spat(env, NUM_EPISODES, agent, DEVICE, ROLLOUT_LEN, agent_spawn, goal_pos)
-
+results = train_spat(env, NUM_EPISODES, agent, DEVICE, ROLLOUT_LEN, goal_pos)
+#results = train_with_curriculum(env_fns=env_factories,env_names=env_names,start_pool_size=1,num_episodes=5000,agent=agent,device=DEVICE,rollout=ROLLOUT_LEN,add_threshold=0.65,rolling_window=200,require_per_env=False, max_envs_to_add=4)
 # --- Save trained agent ---
 new_checkpoint = os.path.join(
     checkpoint_dir,
     f"ppo_{env.spec.id.lower().replace('-', '_')}.pt"
 )
-agent.save(new_checkpoint)
+#agent.save(new_checkpoint)
 
 # --- Logging ---
-df = log_metrics(success_log, env, checkpoint_dir)
+df = log_metrics(results, env, checkpoint_dir)
 plot_training_curve(df, env)
 
 env.close()
