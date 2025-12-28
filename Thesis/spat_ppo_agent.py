@@ -10,32 +10,25 @@ import random
 # Neural Map Memory
 # ---------------------------
 class NeuralMapMemory(nn.Module):
-    def __init__(self, map_channels=32, map_size=16, write_sigma=0.06, init_retention=0.8):
+    def __init__(self, env_size, map_channels=32, map_size=16, write_sigma=0.06):
         """
         write_sigma: in normalized map coordinates (0..1). 0.05 works well for map_size ~16-32.
         """
         super().__init__()
         self.map_channels = map_channels
         self.map_size = map_size
-        self.write_sigma = write_sigma#/ (map_size / 2)
+        self.env_size = env_size
+        self.write_sigma = write_sigma 
+        self.physical_sigma = 0.5 
 
-        # small learnable scalar controlling how strongly gate is applied
         self.write_strength = nn.Parameter(torch.tensor(0.5))  
 
-        # learnable retention: higher -> longer memory (constrained to (0,1) via sigmoid)
-        self.retention_raw = nn.Parameter(torch.tensor(4.6))
-
-
-        # Precompute coordinate grids (normalized 0..1)
         gx = torch.linspace(0, 1, map_size)
         gy = torch.linspace(0, 1, map_size)
         grid_x, grid_y = torch.meshgrid(gx, gy, indexing='xy')
         self.register_buffer("grid_x", grid_x.clone())
         self.register_buffer("grid_y", grid_y.clone())
     
-    def retention(self):
-        return torch.sigmoid(self.retention_raw)
-
     def encode_positions(self, positions):
         """
         positions: (B,2) or (B,1,2) tensor expected to be normalized to [0,1].
@@ -65,96 +58,47 @@ class NeuralMapMemory(nn.Module):
         mask = torch.exp(-(dx + dy) / (2 * sigma**2))
         return mask.unsqueeze(1)  # (B,1,H,W)
 
-    #def write(self, memory, write_vec, positions, write_gate):
-        """
-        memory: (B, C, H, W)
-        write_vec: (B, C)
-        positions: (B, 2) normalized [0,1]
-        """
+    def write(self, memory, write_vec, mask, positions, write_gate):
 
-        if positions is None or write_vec is None:
+        if write_vec is None or positions is None:
             return memory
 
         B, C, H, W = memory.shape
         positions = self.encode_positions(positions)
 
-        if write_gate is None:
-            write_gate = torch.sigmoid(self.write_strength)
-        else:
-            write_gate = write_gate.view(B, 1)
-
-        # Convert normalized position → integer index
-        ix = (positions[:, 0] * (W - 1)).long()
-        iy = (positions[:, 1] * (H - 1)).long()
-
-        memory = memory.clone()  # avoid in-place autograd issues
-
-        for b in range(B):
-            memory[b, :, iy[b], ix[b]] = (
-                (1.0 - write_gate) * memory[b, :, iy[b], ix[b]] +
-                write_gate * write_vec[b]
-            )
-
-        return memory
-    def write(self, memory, write_vec, positions, write_gate):
-        """
-        Gaussian neighborhood overwrite with vector write.
-        """
-
-        if positions is None or write_vec is None:
-            return memory
-
-        B, C, H, W = memory.shape
-        positions = self.encode_positions(positions)
-
-        gate = write_gate.view(B, 1, 1, 1) #torch.sigmoid(self.write_strength)
-        mask = self.gaussian_mask(positions)  # (B,1,H,W)
-        mask = mask / (mask.max(dim=-1, keepdim=True)[0]
-                    .max(dim=-2, keepdim=True)[0] + 1e-6)
+        alpha = write_gate.view(B, 1, 1, 1)
 
         write_vec = write_vec.view(B, C, 1, 1)
 
-        memory = (1 - gate * mask) * memory + (gate * mask) * write_vec
+        beta = 0.2
+        memory = memory + beta * alpha * mask * (write_vec - memory)
+
         return memory
 
+    def read(self, memory, positions, mask):
 
-    def read(self, memory, positions):
-        """
-        Gaussian read from memory → (B, C)
-        """
         if positions is None:
-            # fallback to avg pool
             pooled = F.adaptive_avg_pool2d(memory, 1).squeeze(-1).squeeze(-1)
             return pooled
-
         positions = self.encode_positions(positions)
-        mask = self.gaussian_mask(positions)     # (B,1,H,W)
 
-        mask_sum = mask.sum(dim=[2,3], keepdim=True)
-        mask_normalized = mask / (mask_sum + 1e-8)
+        denom = mask.sum(dim=[2,3]) + 1e-6
+        read_val = (memory * mask).sum(dim=[2,3]) / denom
 
-        read_val = (memory * mask_normalized).sum(dim=[2,3])
         return read_val
-    
-    def retention(self):
-        return torch.sigmoid(self.retention_raw)
-
-    def decay(self, memory):
-        return memory * self.retention()
-
-
 
 
 # ---------------------------
 # Agent Model
 # ---------------------------
 class AgentModel(nn.Module):
-    def __init__(self, obs_channels=6, map_channels=32, map_size=16, hidden_size=256, action_dim=None):
+    def __init__(self, env_size = 10.0, obs_channels=6, map_channels=32, map_size=16, hidden_size=256, action_dim=None):
         super().__init__()
 
         self.map_size = map_size
         self.map_channels = map_channels
-        self.debug_enabled = False
+        self.debug_enabled = True
+        self.env_size = env_size
 
         # obs encoder
         self.obs_encoder = nn.Sequential(
@@ -173,29 +117,36 @@ class AgentModel(nn.Module):
         self.write_scale = nn.Parameter(torch.tensor(1.0), requires_grad=True)
         self.write_fc = nn.Linear(self.map_channels, self.map_channels)
         self.write_gate_fc = nn.Linear(self.map_channels, 1)
+        nn.init.constant_(self.write_gate_fc.bias, -2.0)
 
         self._prev_write_gate = None
 
         # memory
         self.memory_module = NeuralMapMemory(
+            env_size=self.env_size,
             map_channels=map_channels,
             map_size=map_size,
             write_sigma=2.5 / map_size, #1.0/map_size
-            init_retention=0.9
         )
 
         # projection + LSTM
-        self.fc_proj = nn.Linear(map_channels, 256)
-        self.lstm = nn.LSTM(input_size=256, hidden_size=hidden_size, num_layers=1, batch_first=False)
+        self.fc_proj_pi = nn.Linear(2 * map_channels, 256)
+        self.fc_proj_v  = nn.Linear(2 * map_channels, 256)
+        self.lstm_pi = nn.LSTM(256, hidden_size)
+        self.lstm_v  = nn.LSTM(256, hidden_size)
 
         # actor/critic
         self.actor = nn.Linear(hidden_size, action_dim)
         self.critic = nn.Linear(hidden_size, 1)
 
+        self.aux_value_head = nn.Linear(2 * map_channels, 1)
+
         self.apply(self._init_weights)
 
         self.total_env_steps = 0
         self.write_warmup_steps = 500
+
+        self.just_triggered = False
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -204,22 +155,32 @@ class AgentModel(nn.Module):
     
     def init_states(self, batch_size, device):
         memory = torch.zeros(batch_size, self.map_channels, self.map_size, self.map_size, device=device)
-        memory = memory + torch.randn_like(memory) * 0.01
-        h_lstm = torch.zeros(1, batch_size, self.lstm.hidden_size, device=device)
-        c_lstm = torch.zeros(1, batch_size, self.lstm.hidden_size, device=device)
-        lstm_state = (h_lstm, c_lstm)
+        memory = memory + torch.randn_like(memory) * 0.01 
+        h_pi = torch.zeros(1, batch_size, self.lstm_pi.hidden_size, device=device)
+        c_pi = torch.zeros(1, batch_size, self.lstm_pi.hidden_size, device=device)
+        h_v  = torch.zeros(1, batch_size, self.lstm_v.hidden_size,  device=device)
+        c_v  = torch.zeros(1, batch_size, self.lstm_v.hidden_size,  device=device)
         self._prev_write_gate = None
-    
-        return memory, lstm_state
 
-    def forward(self, obs, memory, lstm_state, positions=None , disable_write=None):
+        return {
+            "memory": memory,
+            "h_pi": h_pi,
+            "c_pi": c_pi,
+            "h_v":  h_v,
+            "c_v":  c_v,
+        }
 
-        if self.debug_enabled:
-            for name, param in self.named_parameters():
-                param.register_hook(
-                    lambda grad, name=name: print(f"Grad for {name}: {grad.norm().item():.4f}")
-                    if grad.norm().item() > 5.0 else None
-                )
+    def get_max_write_gate(self):
+        ep = self.total_env_steps //100
+
+        if ep < 1000:
+            return 1.0
+        elif ep < 3000:
+            return 1.0 - 0.7 * (ep - 1000) / 2000
+        else:
+            return 0.3
+
+    def forward(self, obs, state, positions=None , disable_write=None):
 
         if positions is not None and positions.dim() == 3:
             positions = positions.squeeze(1)
@@ -234,36 +195,61 @@ class AgentModel(nn.Module):
             )            
         
         # ---- global write vector ----
-        global_feat = spatial_features.mean(dim=(2,3))  # (B, C)
-        write_vec = torch.tanh(self.write_fc(global_feat))
+        mask = self.memory_module.gaussian_mask(positions)
+        mask = mask / (mask.sum(dim=(2,3), keepdim=True) + 1e-6)
 
-        # ---- write warmup scaling ----
-        write_frac = min(1.0, self.total_env_steps / self.write_warmup_steps)
-        write_vec = write_vec * write_frac * self.write_scale   
+        local_feat = (spatial_features * mask).sum(dim=(2,3))
+        write_vec = self.write_scale * torch.tanh(self.write_fc(local_feat))
 
-        # ---- novelty-gated write ----
-        write_gate = torch.sigmoid(self.write_gate_fc(global_feat))  # (B,1)
-        write_gate = 0.05 + 0.45 * write_gate   # ∈ [0.05, 0.5]
+        # ---- scalar write gate α ----
+        alpha = torch.sigmoid(self.write_gate_fc(local_feat))
+        alpha = torch.clamp(alpha, max=self.get_max_write_gate())
+        self.last_alpha = alpha.mean()
 
-        if self._prev_write_gate is not None:
-            write_gate = 0.9 * self._prev_write_gate + 0.1 * write_gate
+        memory = state["memory"]
 
-        self._prev_write_gate = write_gate.detach()
-
-        self.last_write_gate = write_gate
-        self.last_write_vec = write_vec
-
-
-        # ---- decay + write ----
         if not disable_write and positions is not None:
             memory = self.memory_module.write(
                 memory,
                 write_vec,
+                mask,
                 positions,
-                write_gate
+                alpha
             )
+        
+        # ---- read from memory ----
+        local_read = self.memory_module.read(memory, positions, mask)
+        global_read = memory.mean(dim=(2,3))
 
-        if self.debug_enabled or (self.total_env_steps % 1000 == 0):
+        read_vec = torch.cat([local_read, global_read], dim=-1)
+
+        policy_read = read_vec
+        critic_read = read_vec
+
+        proj_pi = torch.tanh(self.fc_proj_pi(policy_read))
+        proj_v  = torch.tanh(self.fc_proj_v(critic_read))
+
+        h_pi = state["h_pi"]
+        c_pi = state["c_pi"]
+        h_v  = state["h_v"]
+        c_v  = state["c_v"]
+
+        out_pi, (h_pi, c_pi) = self.lstm_pi(proj_pi.unsqueeze(0), (h_pi, c_pi))
+        out_v,  (h_v,  c_v)  = self.lstm_v (proj_v.unsqueeze(0),  (h_v,  c_v))
+
+        pi_logits = self.actor(out_pi.squeeze(0))
+        value = self.critic(out_v.squeeze(0))
+
+        state = {
+            "memory": memory,
+            "h_pi": h_pi,
+            "c_pi": c_pi,
+            "h_v":  h_v,
+            "c_v":  c_v,
+        }
+
+        # Debug: Monitor memory statistics
+        if self.debug_enabled and self.total_env_steps % 1000 == 0 and not self.just_triggered:
             with torch.no_grad():
                 mem_std = memory.std().item()
                 mem_abs = memory.abs().mean().item()
@@ -273,17 +259,20 @@ class AgentModel(nn.Module):
                 
                 if sat_frac > 0.1:
                     print(f"⚠️ Memory saturation: {sat_frac:.2%} > 4.5")
-                if mem_std < 0.01:
+                if mem_std < 0.005:
                     print(f"⚠️ Memory collapsing (std={mem_std:.5f})")
                 if mem_abs > 3.0:
                     print(f"⚠️ Large memory magnitude: {mem_abs:.3f}")
         
-        with torch.no_grad():
-            write_activity = (write_gate > 0.1).float().mean().item()
-            if write_activity < 0.05:
-                print(f"⚠️ Write activity low: {write_activity:.3f}")
+            print(
+                f"α={alpha.mean():.3f} | "
+                f"mem_std={memory.std():.3f} | "
+                f"local_norm={local_read.norm(dim=1).mean():.3f} | "
+                f"global_norm={global_read.norm(dim=1).mean():.3f}"
+                )
 
-        
+            self.just_triggered = True
+
         # Debug: Monitor write operations
         if not disable_write and write_vec is not None:
             with torch.no_grad():
@@ -291,38 +280,17 @@ class AgentModel(nn.Module):
                 if write_std > 2.0:
                     print(f"⚠️ Large write variance: {write_std:.3f}")
 
-        #lstm
-        read_vec = self.memory_module.read(memory, positions)
+        return pi_logits, value, state, read_vec
+    
+    def freeze_policy_and_value_heads(self):
+        for p in self.actor.parameters():
+            p.requires_grad = False
+        for p in self.critic.parameters():
+            p.requires_grad = False
 
-        policy_read = read_vec
-        critic_read = torch.zeros_like(read_vec)
-
-        proj_pi = torch.tanh(self.fc_proj(policy_read))
-        proj_v  = torch.tanh(self.fc_proj(critic_read))
-
-        #proj = torch.tanh(self.fc_proj(read_vec))
-        #proj = proj.unsqueeze(0)  
-
-        h_lstm, c_lstm = lstm_state
-
-        out_pi, (h_pi, c_pi) = self.lstm(proj_pi.unsqueeze(0), lstm_state)
-        out_v, _ = self.lstm(proj_v.unsqueeze(0), lstm_state)
-
-        pi_logits = self.actor(out_pi.squeeze(0))
-        value = self.critic(out_v.squeeze(0))
-
-        return pi_logits, value, memory, (h_pi, c_pi)
-
-        #if h_lstm.device != proj.device:
-        #    h_lstm = h_lstm.to(proj.device)
-        #    c_lstm = c_lstm.to(proj.device)
-
-        #out, (h_lstm, c_lstm) = self.lstm(proj, (h_lstm, c_lstm))
-
-        #pi_logits = self.actor(out.squeeze(0))
-        #value = self.critic(out.squeeze(0))
-
-        #return pi_logits, value, memory, (h_lstm, c_lstm)
+    def unfreeze_all(self):
+        for p in self.parameters():
+            p.requires_grad = True
 
 
 # ---------------------------
@@ -362,6 +330,16 @@ class PPOAgent:
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr, eps=1e-8)
 
+        self.lr_decayed = False
+        self.min_lr = 3e-5
+
+
+        # Entropy scheduling
+        self.entropy_init = 0.005     
+        self.entropy_final = 0.003
+        self.entropy_decay_updates = 600
+        self.update_count = 0
+
         # buffers
         self.reset_buffers()
 
@@ -378,8 +356,9 @@ class PPOAgent:
         self.done_buf = []
         self.values_buf = []
         self.hidden_buf = []
+        self.mem_read_buf = []
 
-    def act(self, obs, memory, lstm_state, position=None, disable_write=False):
+    def act(self, obs, state, position=None, disable_write=False):
         # prepare obs
         if not isinstance(obs, torch.Tensor):
             obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device)
@@ -399,10 +378,9 @@ class PPOAgent:
                 pos_in = pos_in.unsqueeze(0)  # (1,2)
                 
         with torch.no_grad():
-            pi_logits, value, memory, lstm_state = self.model(
-                obs_t, memory, lstm_state, positions=pos_in, disable_write=disable_write
+            pi_logits, value, state, mem_read = self.model(
+                obs_t, state, positions=pos_in, disable_write=disable_write
             )
-            memory = memory.detach()
 
         logits = pi_logits.squeeze(0)
 
@@ -412,10 +390,10 @@ class PPOAgent:
         logp = dist.log_prob(action)
         logits_cpu = logits.detach()
 
-        # return action as int, logp (detached tensor on CPU), value as float, and updated states
-        return int(action.item()), logp.detach(), float(value.item()), memory, lstm_state, logits_cpu
 
-    def store(self, obs, position, action, logp, logits, reward, done, value, hidden, disable_write=False):
+        return int(action.item()), logp.detach(), float(value.item()), state, logits_cpu, mem_read
+
+    def store(self, obs, position, action, logp, logits, reward, done, value, hidden, mem_read, disable_write=False):
         # obs
         if isinstance(obs, torch.Tensor):
             obs_t = obs.detach().cpu()
@@ -442,14 +420,14 @@ class PPOAgent:
         self.rewards_buf.append(float(reward))
         self.done_buf.append(bool(done))
         self.values_buf.append(float(value))
+        self.mem_read_buf.append(mem_read.detach().cpu())
+
 
         # ---- STORE FULL RECURRENT STATE ----
         self.hidden_buf.append({
-            "memory": hidden["memory"].detach().cpu(),
-            "lstm_h": hidden["lstm_h"].detach().cpu(),
-            "lstm_c": hidden["lstm_c"].detach().cpu(),
-            "disable_write": hidden["disable_write"],
+            "state": {k: v.detach().cpu() for k, v in hidden["state"].items()},
             "episode_start": hidden["episode_start"],
+            "disable_write": disable_write,
         })
 
     def compute_gae_from_lists(self, values, rewards, dones, last_value):
@@ -477,6 +455,7 @@ class PPOAgent:
 
         kl_sum = 0.0
         kl_count = 0
+        self.model.just_triggered = False
 
         T = len(self.obs_buf)
         if T < self.rollout_len:
@@ -510,24 +489,24 @@ class PPOAgent:
                 last_pos = self.pos_buf[-1].unsqueeze(0).to(self.device)
 
                 last_hidden = self.hidden_buf[-1]
-                last_memory = last_hidden["memory"].to(self.device)
-                last_lstm = (
-                    last_hidden["lstm_h"].to(self.device),
-                    last_hidden["lstm_c"].to(self.device)
-                )
-                last_disable_write = last_hidden["disable_write"]
-                _, last_value_tensor, _, _ = self.model(
-                    last_obs, last_memory, last_lstm,
+                state = {
+                    k: last_hidden["state"][k].to(self.device)
+                    for k in last_hidden["state"]
+                }
+
+                _, last_value, _, _ = self.model(
+                    last_obs,
+                    state,
                     positions=last_pos,
-                    disable_write=last_disable_write  
+                    disable_write=last_hidden["disable_write"]
                 )
-                last_value = float(last_value_tensor)
+                last_value = float(last_value.item()) 
 
         # ----------- COMPUTE GAE / RETURNS -----------
         adv_np, returns_np = self.compute_gae_from_lists(
-            values=self.values_buf, rewards=self.rewards_buf, dones=self.done_buf, last_value=last_value
-        )
+            values=self.values_buf, rewards=self.rewards_buf, dones=self.done_buf, last_value=last_value)
         adv = torch.tensor(adv_np, dtype=torch.float32, device=self.device)
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         adv = adv.clamp(-4.0, 4.0)
 
         returns = torch.tensor(returns_np, dtype=torch.float32, device=self.device)
@@ -562,49 +541,35 @@ class PPOAgent:
                 if ep_len <= 0:
                     continue
 
-                #adv_ep = adv[ep_start:ep_end]
-                #mean = adv_ep.mean()
-                #std = adv_ep.std(unbiased=False)
-
-                #if std < 1e-6:
-                    #adv[ep_start:ep_end] = adv_ep - mean
-                #else:
-                    #adv[ep_start:ep_end] = (adv_ep - mean) / std
-
                 chunk_starts = list(range(ep_start, ep_end, self.chunk_len))
 
                 for start in chunk_starts:
                     end = min(start + self.chunk_len, ep_end)
 
                     h = self.hidden_buf[start]
-                    if h.get("episode_start", False):
-                        # hard reset at episode boundary
-                        mem = torch.zeros_like(h["memory"]).to(self.device)
-                        lstm = (
-                            torch.zeros_like(h["lstm_h"]).to(self.device),
-                            torch.zeros_like(h["lstm_c"]).to(self.device)
-                        )
-                    else:
-                        mem = h["memory"].to(self.device).detach()
-                        lstm = (
-                            h["lstm_h"].to(self.device).detach(),
-                            h["lstm_c"].to(self.device).detach()
-                        )
 
-                    disable_write = bool(h["disable_write"])
+                    state = {
+                        k: v.to(self.device)
+                        for k, v in h["state"].items()
+                    }
+
+                    if h["episode_start"]:
+                        state = self.model.init_states(batch_size=1, device=self.device)
 
                     # autoregressively run the model for this chunk
                     pi_logits_pred = []
                     values_pred = []
 
+                    state["memory"] = state["memory"].detach()
                     for t in range(start, end):
                         inp_obs = obs[t].unsqueeze(0)  # (1, C, H, W)
                         inp_pos = pos[t].unsqueeze(0) if pos is not None else None
 
-                        logits_t, value_t, mem, lstm = self.model(
-                            inp_obs, mem, lstm, positions=inp_pos, disable_write= disable_write#True #disable memory writes during backprop.
+                        disable_write_t = self.hidden_buf[t]["disable_write"]
+                        logits_t, value_t, state, _ = self.model(
+                            inp_obs, state, positions=inp_pos, disable_write=disable_write_t
                         )
-                        #mem = mem.detach() 
+
                         pi_logits_pred.append(logits_t)
                         values_pred.append(value_t)
 
@@ -627,14 +592,15 @@ class PPOAgent:
                     dist = torch.distributions.Categorical(logits=pi_logits_pred)
                     logp = dist.log_prob(actions_chunk)
                     old_logits_chunk = old_logits[start:end]
-                    old_dist = torch.distributions.Categorical(logits=old_logits_chunk)
+                    old_dist = torch.distributions.Categorical(logits=old_logits_chunk.detach())
                     kl_div = torch.distributions.kl.kl_divergence(old_dist, dist).mean()
 
                     kl_sum += kl_div.item()
                     kl_count += 1
 
-                    if kl_div.item() > 0.2:  # Higher threshold
-                        continue 
+                    if kl_div.item() < 0.005 and self.update_count > 1500:
+                        continue
+
 
                     # policy loss (PPO clipped objective)
                     ratio = torch.exp(logp - old_logp_chunk)
@@ -642,22 +608,29 @@ class PPOAgent:
                     surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * adv_chunk
                     policy_loss = -torch.min(surr1, surr2).mean()
 
-                    logits = pi_logits_pred
-                    turn_bias = torch.abs(logits[:, 0] - logits[:, 1]).mean()
-                    #policy_loss += 0.01 * turn_bias
-
-
-                    # value loss with clipping (use stored old_v)
                     v_pred = values_pred
-                    v_pred_clipped = old_v + (v_pred - old_v).clamp(-self.clip_ratio, self.clip_ratio)
-                    #v_loss_unclipped = (v_pred - ret_chunk).pow(2)
-                    #v_loss_clipped = (v_pred_clipped - ret_chunk).pow(2)
-                    #value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
-                    value_loss = 0.5 * (v_pred - ret_chunk).pow(2).mean()
+                    v_pred_clipped = old_v + (v_pred - old_v).clamp(-0.2, 0.2)
+                    v_loss_unclipped = (v_pred - ret_chunk).pow(2)
+                    v_loss_clipped = (v_pred_clipped - ret_chunk).pow(2)
+                    value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    #value_loss = torch.clamp(value_loss, max=5.0)
+
+                    #value_loss = 0.5 * (v_pred - ret_chunk).pow(2).mean()
 
                     entropy_loss = dist.entropy().mean()
 
-                    loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_loss
+                    mem_reads = torch.stack(self.mem_read_buf).to(self.device)
+                    pred_aux_value = self.model.aux_value_head(mem_reads).squeeze(-1)
+                    aux_value_loss = F.mse_loss(pred_aux_value, returns.detach().unsqueeze(-1))
+
+                    alpha_reg = alpha_reg = 0.0002
+                    alpha_penalty = alpha_reg * self.model.last_alpha
+
+                    aux_coef = 0.1
+
+                    loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_loss + aux_coef * aux_value_loss #+ alpha_penalty
+
+                    aux_coef = max(0.0, 0.1 * (1.0 - self.update_count / 5000))
 
                     # backward step
                     self.optimizer.zero_grad()
@@ -665,8 +638,10 @@ class PPOAgent:
 
                     clipped_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-                    if clipped_norm > self.max_grad_norm * 10:
-                        print(f"Warning: Extreme gradient clipping: {clipped_norm:.2f}")
+                    #if clipped_norm > self.max_grad_norm*10.0:
+                        #print(f"[Grad spike] norm={clipped_norm:.2f}, "
+                        #    f"entropy={entropy_loss.item():.3f}, "
+                        #    f"value_loss={value_loss.item():.3f}")
 
                     with torch.no_grad():
                         value_error = (values - returns).abs().mean().item()
@@ -678,8 +653,8 @@ class PPOAgent:
                                 f"value_std={value_std:.3f}, return_std={return_std:.3f}")
                         
                         # Check for value function collapse
-                        if value_std < 0.01:
-                            print(f"⚠️ Value function collapsed (std={value_std:.4f})")
+                        #if value_std < 0.01:
+                            #print(f"⚠️ Value function collapsed (std={value_std:.4f})")
 
                     self.optimizer.step()
 
@@ -702,12 +677,18 @@ class PPOAgent:
                 'num_chunks': total_chunks
             }
 
-        #self.entropy_coef = max(0.005, self.entropy_coef * 0.995)
-        if np.mean(self.rewards_buf[-100:]) < 0.4:
-            self.entropy_coef = max(0.01, self.entropy_coef * 0.995)
-        else:
-            self.entropy_coef = max(0.02, self.entropy_coef)
-        
+        self.update_count += 1
+
+        progress = min(
+            1.0,
+            self.update_count / self.entropy_decay_updates
+        )
+
+        self.entropy_coef = (
+            self.entropy_init * (1.0 - progress)
+            + self.entropy_final * progress
+        )
+
         # ---- Clear buffers for next rollout ----
         self.reset_buffers()
 

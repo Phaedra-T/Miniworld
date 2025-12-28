@@ -265,12 +265,17 @@ def train_spat(env, num_episodes, agent, device, rollout, goal_pos):
     success_log = []
     best_success = 0
     rollout_step = 0
-    ep = 1
+    success_rate = 0
+    episode = 0
 
     new_checkpoint = os.path.join(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints"),
     f"ppo_{env.spec.id.lower().replace('-', '_')} best.pt"
     )
+
+    # --- custom render composite ---
+    #plt.ion()
+    #fig, (ax_top, ax_fp) = plt.subplots(1, 2, figsize=(8, 4))
 
     for episode in range(num_episodes):
 
@@ -278,32 +283,28 @@ def train_spat(env, num_episodes, agent, device, rollout, goal_pos):
         obs, _ = env.reset()
         agent_pos = env.unwrapped.agent.pos.copy()
         prev_pos = env.unwrapped.agent.pos.copy()
+        episode += 1
 
         episode_reward = 0.0
         done = False
         step = 0
 
-        # ---- Reset recurrent states (on device) ----
-        memory, lstm_state = agent.model.init_states(batch_size=1, device=device)
-
+        state = agent.model.init_states(batch_size=1, device=device)
+        memory = state["memory"]
 
         while not done:
 
             # build state and pos coords (state on device, pos on device)
-            state = build_spat_state(agent_pos, goal_pos, env).unsqueeze(0).to(device)
+            state_tensor = build_spat_state(agent_pos, goal_pos, env).unsqueeze(0).to(device)
             pos_coords = build_position_coords(agent_pos, env).unsqueeze(0).to(device)
             disable_write = agent.model.total_env_steps < agent.model.write_warmup_steps
 
             memory_before = memory.clone().detach()
-            lstm_h_before = lstm_state[0].clone().detach()
-            lstm_c_before = lstm_state[1].clone().detach()
-
             # ---- ACT ----
-            action, logp, value, memory, lstm_state, logits = agent.act(
-                state, memory, lstm_state, pos_coords, disable_write=disable_write
+            action, logp, value, state, logits, read = agent.act(
+                state_tensor, state, pos_coords, disable_write=disable_write
                 )
 
-            ep+= 1
             # --------- STEP ENV ---------
             _, _, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
@@ -316,16 +317,14 @@ def train_spat(env, num_episodes, agent, device, rollout, goal_pos):
             episode_reward += reward
 
             hidden = {
-                "memory": memory_before,     
-                "lstm_h": lstm_h_before,               
-                "lstm_c": lstm_c_before,
+                "state": {k: v.detach().cpu() for k, v in state.items()},
                 "episode_start": (step == 0),
                 "disable_write": disable_write
             }
             
             # ---- Store transition for PPO using hidden_before ----
             agent.store(
-                obs=state.squeeze(0),        
+                obs=state_tensor.squeeze(0),        
                 position=pos_coords.squeeze(0),         
                 action=action,
                 logp=logp,      
@@ -334,7 +333,8 @@ def train_spat(env, num_episodes, agent, device, rollout, goal_pos):
                 done=done,
                 value=value,
                 hidden=hidden,
-                disable_write=disable_write       
+                mem_read=read,
+                disable_write=disable_write
             )
 
             step += 1
@@ -349,6 +349,19 @@ def train_spat(env, num_episodes, agent, device, rollout, goal_pos):
                 break
 
             #env.render()
+            # --- Custom render composite ---
+            #top_view = env.unwrapped.render_top_view()   # top-down RGB array
+            #fp_view = env.render()       # first-person RGB array
+
+            #ax_top.clear()
+            #ax_fp.clear()
+            #ax_top.imshow(top_view)
+            #ax_fp.imshow(fp_view)
+            #ax_top.set_title("Top-Down View")
+            #ax_fp.set_title("Agent View")
+            #ax_top.axis('off')
+            #ax_fp.axis('off')
+            #plt.pause(0.001)
  
         # ---- Episode logging ----
         success = int(terminated)
@@ -390,63 +403,48 @@ def train_spat(env, num_episodes, agent, device, rollout, goal_pos):
 
     return success_log
 
-def build_spat_state(agent_pos, goal_pos, env, grid_size=32):
-    min_x, max_x = env.unwrapped.min_x, env.unwrapped.max_x
-    min_z, max_z = env.unwrapped.min_z, env.unwrapped.max_z
-    
-    # Only 4 channels for simplicity
-    state_map = np.zeros((6, grid_size, grid_size), dtype=np.float32)
-    
-    # Convert to continuous grid coordinates
-    def to_continuous(pos):
-        x = (pos[0] - min_x) / (max_x - min_x)
-        z = (pos[2] - min_z) / (max_z - min_z)
-        return np.clip(x, 0, 1), np.clip(z, 0, 1)
-    
-    # 1. Agent position heatmap
-    ax, az = to_continuous(agent_pos)
-    for i in range(grid_size):
-        for j in range(grid_size):
-            dx = (i/(grid_size-1) - ax) * grid_size
-            dz = (j/(grid_size-1) - az) * grid_size
-            state_map[0, j, i] = np.exp(-(dx*dx + dz*dz) / 2.0)
-    
-    # 2. Goal position heatmap
-    gx, gz = to_continuous(goal_pos)
-    for i in range(grid_size):
-        for j in range(grid_size):
-            dx = (i/(grid_size-1) - gx) * grid_size
-            dz = (j/(grid_size-1) - gz) * grid_size
-            state_map[1, j, i] = np.exp(-(dx*dx + dz*dz) / 2.0)
-    
-    # 3. Distance to goal gradient
-    for i in range(grid_size):
-        for j in range(grid_size):
-            wx = min_x + (i / (grid_size - 1)) * (max_x - min_x)
-            wz = min_z + (j / (grid_size - 1)) * (max_z - min_z)
-            d = np.linalg.norm([wx - goal_pos[0], wz - goal_pos[2]])
-            max_d = np.sqrt((max_x-min_x)**2 + (max_z-min_z)**2)
-            state_map[2, j, i] = 1.0 - (d / max_d)  # 1 at goal, 0 far away
-    
-    # 4. Relative goal direction (sine component)
-    goal_vec = goal_pos - agent_pos
-    goal_angle = np.arctan2(goal_vec[2], goal_vec[0])
+def build_spat_state(agent_pos, goal_pos, env, view_radius = 2, grid_size=32):
 
-    #heading = env.unwrapped.agent.dir
-    dir_idx = int(env.unwrapped.agent.dir)
-    n_dirs = 8  # MiniWorld default
-    heading = (dir_idx / n_dirs) * 2 * np.pi
+        size = 2 * view_radius + 1
+        state = np.zeros((3, size, size), dtype=np.float32)
 
-    rel_angle = (goal_angle - heading + np.pi) % (2 * np.pi) - np.pi
-    
-    # Fill entire map with this relative angle information
-    state_map[3, :, :] = np.sin(rel_angle)  # Sine encodes direction
-    state_map[4, :, :] = np.cos(rel_angle)
+        min_x, max_x = env.unwrapped.min_x, env.unwrapped.max_x
+        min_z, max_z = env.unwrapped.min_z, env.unwrapped.max_z
 
-    dist = np.linalg.norm(goal_pos - agent_pos)
-    state_map[5, :, :] = dist / max_d
-    
-    return torch.from_numpy(state_map).float()
+        # --- Heading ---
+        dir_idx = int(env.unwrapped.agent.dir)
+        n_dirs = 8
+        heading = (dir_idx / n_dirs) * 2 * np.pi
+
+        cos_h, sin_h = np.cos(heading), np.sin(heading)
+
+        # --- Helper: world → egocentric grid ---
+        def world_to_ego(wx, wz):
+            dx = wx - agent_pos[0]
+            dz = wz - agent_pos[2]
+
+            # rotate into egocentric frame
+            ex =  cos_h * dx + sin_h * dz
+            ez = -sin_h * dx + cos_h * dz
+
+            gx = int(round(ex)) + view_radius
+            gz = int(round(ez)) + view_radius
+
+            return gx, gz
+
+        # --- Channel 0: local occupancy (free space proxy) ---
+        # Empty room → constant 1.0 inside view
+        state[0, :, :] = 1.0
+
+        # --- Channel 1: goal visible only if inside view ---
+        gx, gz = world_to_ego(goal_pos[0], goal_pos[2])
+        if 0 <= gx < size and 0 <= gz < size:
+            state[1, gz, gx] = 1.0
+
+        # --- Channel 2: heading encoding (broadcast) ---
+        state[2, :, :] = sin_h  # or cos_h if you prefer
+
+        return torch.from_numpy(state).float()
 
 
 def build_position_coords(agent_pos, env):
@@ -465,8 +463,8 @@ def compute_reward(prev_pos, curr_pos, goal_pos, terminated):
     reward = -0.01  # time penalty
 
     # progress shaping
-    progress = prev_dist - curr_dist
-    reward += 0.5 * np.clip(progress, -0.05, 0.05)
+    #progress = prev_dist - curr_dist
+    #reward += 0.5 * np.clip(progress, -0.05, 0.05)
 
     if terminated:
         reward += 1.0  

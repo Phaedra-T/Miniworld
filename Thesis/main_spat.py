@@ -9,24 +9,22 @@ from utils import build_spat_state, get_latest_checkpoint, train_spat, log_metri
 
 
 # --- Hyperparameters ---
-env_name = "MiniWorld-OneRoomS6-v0" 
-NUM_EPISODES = 20000 
-LR = 1e-4
+env_name = "MiniWorld-ColorCueCorridor-v0" 
+NUM_EPISODES = 10000 
+LR = 7e-5 
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP = 0.05
-ENTROPY = 0.02
+CLIP = 0.15
+ENTROPY = 0.001
 VALUE_COEF = 0.25
-MAX_GRAD_NORM = 1.0
-ROLLOUT_LEN = 512
-EPOCHS = 4
+MAX_GRAD_NORM = 0.25
+ROLLOUT_LEN = 512 
+EPOCHS = 4 
 CHUNK_LEN = 32
 WRITE_WARMUP_STEPS = 1000
 
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
-
 
 # --- Paths ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -34,8 +32,8 @@ checkpoint_dir = os.path.join(script_dir, "checkpoints")
 os.makedirs(checkpoint_dir, exist_ok=True)
 
 # --- Initialize environment ---
-env = gym.make(env_name, render_mode= None )
-env.set_wrapper_attr(name="max_episode_steps", value=100)
+env = gym.make(env_name, render_mode= None) #"rgb_array" )
+env.set_wrapper_attr(name="max_episode_steps", value=500)
 obs, _ = env.reset()
 
 NORM_SCALE = max(
@@ -78,6 +76,7 @@ if latest_checkpoint:
     print(f"✅ Loaded checkpoint: {latest_checkpoint}")
 else:
     print("⚠️ No checkpoint found. Training from scratch!")
+
 
 # --- Training ---
 results = train_spat(env, NUM_EPISODES, agent, DEVICE, ROLLOUT_LEN, goal_pos)
